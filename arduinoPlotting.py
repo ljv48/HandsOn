@@ -21,13 +21,25 @@ fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 4))
 # data containers
 force_data, flex_data, move_data = [], [], []
 
+
+def fsr_to_psi(analog_value, r_fixed=10000, k=800000, area_in2=0.125):
+    # Converts FSR analog reading (0–1023) to approximate PSI.
+
+    if analog_value == 0:
+        return 0
+    r_fsr = r_fixed * (1023 - analog_value) / analog_value
+    force_g = k / r_fsr
+    psi = (force_g * 0.00220462) / area_in2  # grams → pounds → psi
+    return psi
+
+
 # empty plot lines
 force_line, = ax1.plot([], [], label="Force Sensor", color='blue')
 flex_line,  = ax2.plot([], [], label="Flex Sensor", color='green')
 move_line,  = ax3.plot([], [], label="Movement Sensor", color='orange')
 
 # labeling
-for ax, title in zip(  # takes objects and turns into tuples to assign elements to the ax and title
+for ax, title in zip(
     [ax1, ax2, ax3],
     ["Force Sensor Data", "Flex Sensor Data", "Movement Sensor Data"]
 ):
@@ -38,8 +50,12 @@ for ax, title in zip(  # takes objects and turns into tuples to assign elements 
     ax.set_title(title)
     ax.legend()
 
-plt.ion()  # interactive mode for live updates
-plt.show()  # shows figures
+# update y-axis label for force
+ax1.set_ylabel("Force (PSI)")
+ax1.set_ylim(0, 50)  # adjust based on expected range
+plt.ion()
+plt.show()
+
 
 # allows serial reading continuously
 while True:
@@ -53,14 +69,22 @@ while True:
             value = int(match.group(1))  # converts to integer
 
             if "Force" in raw_line:
-                force_data.append(value)  # adds new data point
-                force_line.set_ydata(force_data)  # updates y-axis data
-                force_line.set_xdata(range(len(force_data)))  # updates x-axis to match new length
-                ax1.relim()  # calculates the new minimum and maximum data values
-                ax1.autoscale_view(True, True, True)  # applies these new limits to the plot
+                psi_value = fsr_to_psi(value)  # Convert analog reading to PSI
+                force_data.append(psi_value)
+
+                # limit number of displayed points
+                if len(force_data) > max_points:
+                    force_data = force_data[-max_points:]
+
+                force_line.set_ydata(force_data)
+                force_line.set_xdata(range(len(force_data)))
+                ax1.relim()
+                ax1.autoscale_view(True, True, True)
 
             elif "Flex" in raw_line:
                 flex_data.append(value)
+                if len(flex_data) > max_points:
+                    flex_data = flex_data[-max_points:]
                 flex_line.set_ydata(flex_data)
                 flex_line.set_xdata(range(len(flex_data)))
                 ax2.relim()
@@ -68,9 +92,11 @@ while True:
 
             elif "Movement" in raw_line:
                 move_data.append(value)
+                if len(move_data) > max_points:
+                    move_data = move_data[-max_points:]
                 move_line.set_ydata(move_data)
                 move_line.set_xdata(range(len(move_data)))
                 ax3.relim()
                 ax3.autoscale_view(True, True, True)
 
-            plt.pause(0.05)  # pauses execution @ 0.05 seconds
+            plt.pause(0.05)   # small delay for updates
