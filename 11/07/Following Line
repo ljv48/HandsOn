@@ -1,0 +1,180 @@
+import serial
+import time
+import re
+import matplotlib.pyplot as plt
+from datetime import datetime, timezone
+from supabase import create_client, Client
+
+# --- Supabase setup ---
+url = "https://tslcyteqrbeiwjifpdeb.supabase.co"
+key = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRzbGN5dGVxcmJlaXdqaWZwZGViIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjE2NTcwMzIsImV4cCI6MjA3NzIzMzAzMn0.VWqv2VkqJ7csDKn6G947T-J7Pf9jlHhGWo33B0eof2s"
+supabase: Client = create_client(url, key)
+
+
+# --- Serial setup ---
+port = '/dev/cu.usbmodem14201'  # Change to your Arduino port
+baud = 9600
+max_points = 50
+
+print("Connecting to Arduino...")
+ser = serial.Serial(port, baud, timeout=1)
+time.sleep(2)
+print(f"Connected to {port}")
+
+# --- Matplotlib setup ---
+plt.ion()
+fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 4))
+
+# Data containers
+force_trainer, flex_trainer, move_trainer = [], [], []
+force_trainee, flex_trainee, move_trainee = [], [], []
+time_data = []
+
+# Plot lines
+force_line_trainer, = ax1.plot([], [], label="Trainer", color='red')
+force_line_trainee, = ax1.plot([], [], label="Trainee", color='blue')
+flex_line_trainer, = ax2.plot([], [], label="Trainer", color='green')
+flex_line_trainee, = ax2.plot([], [], label="Trainee", color='orange')
+move_line_trainer, = ax3.plot([], [], label="Trainer", color='purple')
+move_line_trainee, = ax3.plot([], [], label="Trainee", color='brown')
+
+# Graph labeling
+for ax, title in zip([ax1, ax2, ax3], ["Force Sensor Data", "Flex Sensor Data", "Movement Sensor Data"]):
+    ax.set_xlim(0, max_points)
+    ax.set_ylim(0, 1023)
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Value")
+    ax.set_title(title)
+    ax.legend()
+
+ax1.set_ylabel("Force (PSI)")
+ax1.set_ylim(0, 50)
+
+plt.show()
+
+
+# PSI Calibration
+def fsr_to_psi(analog_value, r_fixed=10000, k=800000, area_in2=0.125):
+    if analog_value == 0:
+        return 0
+    r_fsr = r_fixed * (1023 - analog_value) / analog_value
+    force_g = k / r_fsr
+    psi = (force_g * 0.00220462) / area_in2
+    return psi
+
+
+def fetch_trainer_data():
+    response = supabase.table("trainer_data").select("*").order("timestamp", desc=True).limit(max_points).execute()
+    data = response.data or []
+    # Reverse data so that oldest points come first (chronological order)
+    data.reverse()
+    # Extract sensor readings into separate lists
+    forces = [d["force"] for d in data]
+    flexes = [d["flex"] for d in data]
+    moves = [d["move"] for d in data]
+    return forces, flexes, moves
+
+
+def calculate_score(trainer, trainee, tolerance=5):
+    if not trainer:
+        return 0
+    matched = sum(1 for t, u in zip(trainer, trainee) if abs(t - u) <= tolerance)  # Count number of readings where trainee is within tolerance of trainer
+    return (matched / len(trainer)) * 100   # Calculate percentage of matched points
+
+
+def store_trainee(force, flex, move, score):
+    data = {
+        "force": float(force),
+        "flex": float(flex),
+        "move": float(move),
+        "score": float(score),
+        "timestamp": datetime.now(timezone.utc).isoformat()  # ISO string for timestamptz
+    }
+    response = supabase.table("trainee_data").insert(data).execute()
+    print(response)
+
+
+# --- Main loop ---
+start_time = time.time()
+
+
+try:
+    while True:
+        if ser.in_waiting > 0:
+            raw_line = ser.readline().decode('utf-8', errors='ignore').strip()
+            match = re.search(r'(\d+)', raw_line)
+            if not match:
+                continue
+            value = int(match.group(1))
+
+            # Fetch trainer data
+            trainer_force, trainer_flex, trainer_move = fetch_trainer_data()
+            force_trainer = trainer_force[-max_points:]
+            flex_trainer = trainer_flex[-max_points:]
+            move_trainer = trainer_move[-max_points:]
+
+            current_time = time.time() - start_time
+            time_data.append(current_time)
+            if len(time_data) > max_points:
+                time_data = time_data[-max_points:]
+
+            # --- Process sensors ---
+            if "Force" in raw_line:
+                psi_value = fsr_to_psi(value)
+                force_trainee.append(psi_value)
+                if len(force_trainee) > max_points:
+                    force_trainee = force_trainee[-max_points:]
+                force_line_trainer.set_ydata(force_trainer)
+                force_line_trainer.set_xdata(range(len(force_trainer)))
+                force_line_trainee.set_ydata(force_trainee)
+                force_line_trainee.set_xdata(range(len(force_trainee)))
+                ax1.relim()
+                ax1.autoscale_view(True, True, True)
+
+            elif "Flex" in raw_line:
+                flex_trainee.append(value)
+                if len(flex_trainee) > max_points:
+                    flex_trainee = flex_trainee[-max_points:]
+                flex_line_trainer.set_ydata(flex_trainer)
+                flex_line_trainer.set_xdata(range(len(flex_trainer)))
+                flex_line_trainee.set_ydata(flex_trainee)
+                flex_line_trainee.set_xdata(range(len(flex_trainee)))
+                ax2.relim()
+                ax2.autoscale_view(True, True, True)
+
+            elif "Movement" in raw_line:
+                move_trainee.append(value)
+                if len(move_trainee) > max_points:
+                    move_trainee = move_trainee[-max_points:]
+                move_line_trainer.set_ydata(move_trainer)
+                move_line_trainer.set_xdata(range(len(move_trainer)))
+                move_line_trainee.set_ydata(move_trainee)
+                move_line_trainee.set_xdata(range(len(move_trainee)))
+                ax3.relim()
+                ax3.autoscale_view(True, True, True)
+
+            # --- Compute score based on force only ---
+            score = calculate_score(force_trainer, force_trainee)
+            print(f"Trainee Score: {score:.2f}%")
+
+            # --- Store trainee data ---
+            store_trainee(
+                force_trainee[-1] if force_trainee else 0,
+                flex_trainee[-1] if flex_trainee else 0,
+                move_trainee[-1] if move_trainee else 0,
+                score
+            )
+
+            plt.pause(0.05)
+
+except KeyboardInterrupt:
+    # Final session summary
+    score = calculate_score(force_trainer, force_trainee)
+    duration = time.time() - start_time
+    print(f"\nFinal Score: {score:.2f}% | Duration: {duration:.2f}s")
+    store_trainee(
+        force_trainee[-1] if force_trainee else 0,
+        flex_trainee[-1] if flex_trainee else 0,
+        move_trainee[-1] if move_trainee else 0,
+        score
+    )
