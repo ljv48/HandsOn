@@ -1,0 +1,183 @@
+import serial
+import time
+import re
+import matplotlib.pyplot as plt
+from supabase import create_client, Client
+
+# --- Supabase setup ---
+SUPABASE_URL = "https://tslcyteqrbeiwjifpdeb.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRzbGN5dGVxcmJlaXdqaWZwZGViIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjE2NTcwMzIsImV4cCI6MjA3NzIzMzAzMn0.VWqv2VkqJ7csDKn6G947T-J7Pf9jlHhGWo33B0eof2s"
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# --- Arduino setup ---
+port = '/dev/cu.usbmodem14201'  # Update to your Arduino port
+baud = 9600
+max_points = 50
+x_window = 10  # seconds shown on x-axis window
+
+print("Connecting to Arduino...")
+ser = serial.Serial(port, baud, timeout=1)
+time.sleep(2)
+print(f"Connected to {port}")
+
+# --- Matplotlib setup ---
+fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 4))
+plt.ion()
+plt.show()
+
+# Data buffers
+force_data, flex_data, move_data = [], [], []
+force_time, flex_time, move_time = [], [], []
+
+# Conversion: FSR (0-1023) → PSI
+# PSI Calibration
+def fsr_to_psi(analog_value, r_fixed=10000, k=800000, area_in2=0.125, calibration_factor=5.0):
+    """
+    Convert raw FSR analog value (0–1023) to estimated PSI.
+    Includes calibration_factor to adjust for your specific setup.
+    """
+    if analog_value <= 0:
+        return 0
+    if analog_value >= 1023:
+        analog_value = 1022.9  # avoid div-by-zero
+
+    r_fsr = r_fixed * (1023 - analog_value) / analog_value
+    if r_fsr <= 0:
+        return 0
+
+    force_g = k / r_fsr
+    psi = (force_g * 0.00220462) / area_in2
+
+    # Apply calibration multiplier to bring range up
+    psi *= calibration_factor
+    return psi
+
+
+# Plot lines
+force_line, = ax1.plot([], [], label="Force Sensor", color='blue')
+flex_line,  = ax2.plot([], [], label="Flex Sensor", color='green')
+move_line,  = ax3.plot([], [], label="Movement Sensor", color='orange')
+
+# Threshold (constant force reference)
+threshold_psi = 20
+tolerance = 2  # how close (± PSI) counts as "on the line"
+threshold_line = ax1.axhline(y=threshold_psi, color='red', linestyle='--', label=f"Threshold ({threshold_psi} PSI)")
+
+# Labeling graphs
+for ax, title in zip([ax1, ax2, ax3],
+                     ["Force Sensor Data", "Flex Sensor Data", "Movement Sensor Data"]):
+    ax.set_xlim(0, x_window)
+    ax.set_ylim(0, 1023)
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Analog Reading")
+    ax.set_title(title)
+    ax.legend()
+
+ax1.set_ylabel("Force (PSI)")
+ax1.set_ylim(0, 50)
+
+# --- Main Loop ---
+start_time = time.time()
+time_on_threshold = 0.0
+last_update_time = start_time
+
+try:
+    while True:
+        if ser.in_waiting > 0:
+            raw_line = ser.readline().decode('utf-8', errors='ignore').strip()
+            print(raw_line)
+
+            match = re.search(r'(\d+)', raw_line)
+            if not match:
+                continue
+
+            value = float(match.group(1))
+            current_time = time.time() - start_time
+
+            # Force Sensor
+            if "Force" in raw_line:
+                psi_value = fsr_to_psi(value)
+                current_time = time.time() - start_time
+                force_time.append(current_time)
+                force_data.append(psi_value)
+
+                    # Saving to Supabase
+                data = {
+                    "sensor_type": "Force",
+                    "value": psi_value,
+                    "unit": "PSI"
+                }
+                try:
+                    supabase.table("trainee_data").insert(data).execute()
+                except Exception as e:
+                    print(f"Supabase upload error: {e}")
+
+                # Maintain window size
+                if len(force_data) > max_points:
+                    force_data = force_data[-max_points:]
+                    force_time = force_time[-max_points:]
+
+                # --- Constant force scoring ---
+                now = time.time()
+                time_delta = now - last_update_time
+                last_update_time = now
+
+                # If force is within ± tolerance of threshold, count time as "on line"
+                if abs(psi_value - threshold_psi) <= tolerance:
+                    time_on_threshold += time_delta
+
+                # Real-time score update
+                duration = now - start_time
+                percentage_on_line = (time_on_threshold / duration) * 100 if duration > 0 else 0
+
+                    # Plot
+                force_line.set_xdata(force_time)
+                force_line.set_ydata(force_data)
+                current_max = max(force_data) if len(force_data) > 0 else 50
+                ax1.set_ylim(0, max(50, current_max + 5))
+                ax1.relim()
+                ax1.autoscale_view(True, True, True)
+
+            # Flex Sensor
+            elif "Flex" in raw_line:
+                flex_time.append(current_time)
+                flex_data.append(value)
+                if len(flex_data) > max_points:
+                    flex_data = flex_data[-max_points:]
+                    flex_time = flex_time[-max_points:]
+                flex_line.set_xdata(flex_time)
+                flex_line.set_ydata(flex_data)
+                ax2.relim()
+                ax2.autoscale_view(True, True, True)
+
+            # Movement Sensor
+            elif "Movement" in raw_line:
+                move_time.append(current_time)
+                move_data.append(value)
+                if len(move_data) > max_points:
+                    move_data = move_data[-max_points:]
+                    move_time = move_time[-max_points:]
+                move_line.set_xdata(move_time)
+                move_line.set_ydata(move_data)
+                ax3.relim()
+                ax3.autoscale_view(True, True, True)
+
+            # Shift x-axis
+            for ax, t_data in zip([ax1, ax2, ax3], [force_time, flex_time, move_time]):
+                if len(t_data) > 0:
+                    ax.set_xlim(max(0, t_data[-1] - x_window), t_data[-1])
+
+            plt.pause(0.05)
+
+except KeyboardInterrupt:
+    duration = time.time() - start_time
+    percentage_on_line = (time_on_threshold / duration) * 100 if duration > 0 else 0
+
+    print("\n--- Session Ended ---")
+    print(f"Duration: {duration:.2f} s")
+    print(f"Time on threshold line: {time_on_threshold:.2f} s")
+    print(f"Constant Force Score: {percentage_on_line:.1f}%")
+
+    plt.ioff()
+    plt.show()
+    ser.close()
